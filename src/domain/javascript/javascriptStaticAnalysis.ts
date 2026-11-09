@@ -30,7 +30,10 @@ import {
 import { semanticResourceLimitReason } from "./javascriptSemanticResourceLimits.js";
 import { createStaticPathIntrinsicQuery } from "./javascriptStaticPathIntrinsics.js";
 import { createSemanticExpressionShapeResolver } from "./javascriptSemanticExpressionShapes.js";
-import { finishElectronBrowserWindowsSteps } from "./electronStaticAnalysisBrowser.js";
+import {
+  finishElectronBrowserWindowsSteps,
+  finishElectronContextBridgesSteps,
+} from "./electronStaticAnalysisBrowser.js";
 import {
   detectVendors,
   failedJavaScriptStaticAnalysis,
@@ -152,6 +155,7 @@ export function* analyzeParsedJavaScriptStaticSourceSteps(
   finishBundlerExports(accumulator, index);
   yield* finishElectronNativeBindingsSteps(findings, index);
   yield* finishElectronBrowserWindowsSteps(findings, index);
+  yield* finishElectronContextBridgesSteps(findings, index);
   yield* finishElectronDynamicCodeSteps(findings, index);
   if (accumulator.pendingModuleRequireCalls.length > 0) {
     yield* index.indexMemberMutationFactsSteps();

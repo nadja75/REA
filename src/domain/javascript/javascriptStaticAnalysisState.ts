@@ -13,6 +13,7 @@ import type {
   JavaScriptStaticReference,
   JavaScriptStaticStorage,
 } from "./javascriptStaticAnalysisTypes.js";
+import type { ContextBridgeMemberBudget } from "./electronStaticAnalysisValues.js";
 import type {
   ElectronAppPathChangeFinding,
   ElectronCallPath,
@@ -87,6 +88,11 @@ export interface JavaScriptAnalysisAccumulator {
     readonly constructor: ElectronWindowConstructor;
   }[];
   readonly contextBridgeApis: LocatedJavaScriptFinding<ElectronContextBridgeFinding>[];
+  readonly pendingContextBridgeApis: (
+    | t.CallExpression
+    | t.OptionalCallExpression
+  )[];
+  contextBridgeMemberBudget?: ContextBridgeMemberBudget;
   readonly ipc: LocatedJavaScriptFinding<ElectronIpcFinding>[];
   readonly senderValidations: LocatedJavaScriptFinding<ElectronSenderValidationFinding>[];
   readonly utilityProcesses: LocatedJavaScriptFinding<ElectronUtilityProcessFinding>[];
@@ -198,6 +204,7 @@ export const createJavaScriptAnalysisAccumulator = (
   browserWindows: [],
   pendingBrowserWindows: [],
   contextBridgeApis: [],
+  pendingContextBridgeApis: [],
   ipc: [],
   senderValidations: [],
   utilityProcesses: [],
