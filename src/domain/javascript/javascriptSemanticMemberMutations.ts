@@ -4,13 +4,17 @@ import {
   createAmbientPathResolver,
   retainSemanticAmbientEffect,
 } from "./javascriptSemanticAmbientWrites.js";
-import { isIntrinsicMapLookup } from "./javascriptSemanticMapOperations.js";
+import { isIntrinsicNonEscapingArrayCall } from "./javascriptSemanticArrayOperations.js";
+import { isIntrinsicNonEscapingMapCall } from "./javascriptSemanticMapOperations.js";
+import { isIntrinsicNonEscapingObjectCall } from "./javascriptSemanticObjectOperations.js";
+import { isIntrinsicNonEscapingXhrOpen } from "./javascriptNetworkRequests.js";
 import {
   isIntrinsicTypedArrayConstruction,
   isTypedArrayNumericIndex,
 } from "./javascriptSemanticTypedArrays.js";
 
 import {
+  semanticModuleAcquisitionEffectOrigin,
   semanticGlobalProcessOrigin,
   semanticGlobalProcessPathOrigin,
   semanticOriginalGlobalProcessAt,
@@ -354,7 +358,20 @@ export function* collectSemanticMemberMutationsSteps(
   state: JavaScriptSemanticAnalysisState,
   referenceMayHaveChangedAt: JavaScriptBindingIndex["referenceMayHaveChangedAt"],
 ): Generator<void, void> {
-  const deferredMapReceivers = new Set<
+  const intrinsicReceiverCall = (
+    node: t.CallExpression | t.OptionalCallExpression,
+    index?: Pick<JavaScriptBindingIndex, "referenceMayHaveChangedAt">,
+  ): boolean | undefined => {
+    const map = isIntrinsicNonEscapingMapCall(node, state, index);
+    if (map !== false) return map;
+    const xhr = isIntrinsicNonEscapingXhrOpen(node, state, index);
+    if (xhr !== false) return xhr;
+    const array = isIntrinsicNonEscapingArrayCall(node, state, index);
+    return array === false
+      ? isIntrinsicNonEscapingObjectCall(node, state, index)
+      : array;
+  };
+  const deferredIntrinsicReceivers = new Set<
     t.CallExpression | t.OptionalCallExpression
   >();
   // The binding pass already retained callable nodes. Ordinary data-only code
@@ -740,6 +757,8 @@ export function* collectSemanticMemberMutationsSteps(
         readonly bindings: ReadonlySet<string>;
         readonly originAt: t.Node | undefined;
         readonly definiteReceiver: boolean;
+        /** Only value-preserving branches may carry an await to an acquisition. */
+        readonly awaitedModuleAcquisition?: boolean;
         readonly exactKey?: string;
         readonly joined?: {
           readonly key: string;
@@ -873,14 +892,20 @@ export function* collectSemanticMemberMutationsSteps(
       )
         continue;
       const expression = unwrapJavaScriptExpression(current.node).node;
-      const required = semanticRequireOriginCandidate(expression, state, true);
-      if (required !== undefined) {
+      const moduleEffectOrigin =
+        semanticRequireOriginCandidate(expression, state, true)?.origin ??
+        semanticModuleAcquisitionEffectOrigin(
+          expression,
+          state,
+          current.awaitedModuleAcquisition,
+        );
+      if (moduleEffectOrigin !== undefined) {
         recordRequiredEffect(
-          required.origin.specifier,
-          [...required.origin.importedPath, ...current.path],
+          moduleEffectOrigin.specifier,
+          [...moduleEffectOrigin.importedPath, ...current.path],
           effect,
           mutation,
-          required.origin.loaderAuthority,
+          moduleEffectOrigin.loaderAuthority,
         );
         continue;
       }
@@ -1314,8 +1339,17 @@ export function* collectSemanticMemberMutationsSteps(
           ]),
         });
       } else {
+        // Escape flattening must not discard the await before its value branch
+        // reaches a direct acquisition. Other escapes keep the shared cache.
+        const awaitedModuleAcquisition =
+          t.isAwaitExpression(expression) ||
+          (current.awaitedModuleAcquisition === true &&
+            (t.isConditionalExpression(expression) ||
+              t.isLogicalExpression(expression) ||
+              t.isSequenceExpression(expression) ||
+              t.isAssignmentExpression(expression)));
         const references =
-          effect === "escape"
+          effect === "escape" && !awaitedModuleAcquisition
             ? escapedReferenceLeaves(
                 expression,
                 current.path,
@@ -1370,6 +1404,11 @@ export function* collectSemanticMemberMutationsSteps(
           else
             enqueue({
               ...value,
+              // This await consumes the branch value, not a property, alias,
+              // container child, or callback result. Those paths drop it.
+              ...(awaitedModuleAcquisition
+                ? { awaitedModuleAcquisition: true }
+                : {}),
               bindings: current.bindings,
               definiteReceiver:
                 current.definiteReceiver &&
@@ -1697,9 +1736,9 @@ export function* collectSemanticMemberMutationsSteps(
           else markEscaped(argument, node);
         // Constructing a member does not pass its container as `this`.
         if (!t.isNewExpression(node)) {
-          const mapLookup = isIntrinsicMapLookup(node, state);
-          if (mapLookup === undefined) deferredMapReceivers.add(node);
-          else if (!mapLookup) markReceiver(node.callee, node);
+          const intrinsicCall = intrinsicReceiverCall(node);
+          if (intrinsicCall === undefined) deferredIntrinsicReceivers.add(node);
+          else if (!intrinsicCall) markReceiver(node.callee, node);
         }
       } else if (t.isTaggedTemplateExpression(node)) {
         for (const source of returnedReferences(node.tag).references)
@@ -1715,7 +1754,7 @@ export function* collectSemanticMemberMutationsSteps(
   while (
     pendingReferences.length > 0 ||
     iterableReferences.length > 0 ||
-    deferredMapReceivers.size > 0
+    deferredIntrinsicReceivers.size > 0
   ) {
     const effectsBefore = recordedEffectCount;
     const iterablesBefore = iterableReferences.length;
@@ -1818,18 +1857,15 @@ export function* collectSemanticMemberMutationsSteps(
         reference,
       );
     }
-    // Native Map lookup methods do not expose their receiver to user code.
+    // Proven native Map and pristine XHR/Array/Object calls do not expose receivers.
     // Settle genuine effects first, then replay every unproven receiver escape.
     // Keep proven sites until convergence: later propagated effects can revoke them.
     let receiverIndex = 0;
-    for (const node of deferredMapReceivers) {
+    for (const node of deferredIntrinsicReceivers) {
       if (receiverIndex++ % 64 === 0) yield;
-      if (
-        isIntrinsicMapLookup(node, state, { referenceMayHaveChangedAt }) ===
-        true
-      )
+      if (intrinsicReceiverCall(node, { referenceMayHaveChangedAt }) === true)
         continue;
-      deferredMapReceivers.delete(node);
+      deferredIntrinsicReceivers.delete(node);
       markReceiver(node.callee, node);
     }
     if (
@@ -1971,13 +2007,33 @@ const constructedReferenceValues = (
   const classes = t.isClass(node)
     ? [node]
     : semanticClassCandidates(node.callee, state);
-  return classes.flatMap((owner) =>
+  const references: ReferencedValue[] = classes.flatMap((owner) =>
     semanticClassPropertyReferences(
       { owner, kind: t.isClass(node) ? "static" : "instance" },
       [key, ...remaining],
       state,
     ),
   );
+  // A constructed receiver may expose its constructor or prototype even when
+  // the class is imported and has no local AST. Retain these as inherited
+  // may-references, not exact value provenance, with the original effect site.
+  // Replacing the instance slot itself was excluded above.
+  if (
+    t.isNewExpression(node) &&
+    // Copied-slot selections contain own enumerable values, never inherited
+    // constructor/prototype links. A null key is an ordinary unknown read.
+    (key === null || typeof key !== "object")
+  ) {
+    if (semanticPropertyPathKeyMatches(key, "constructor"))
+      references.push({ node: node.callee, path: remaining, inherited: true });
+    if (semanticPropertyPathKeyMatches(key, "__proto__"))
+      references.push({
+        node: node.callee,
+        path: ["prototype", ...remaining],
+        inherited: true,
+      });
+  }
+  return references;
 };
 
 const branchReferenceValues = (
@@ -2118,6 +2174,7 @@ const observableMutationPaths = (
     const hasParsedRequireOrigin = binding.initializers.some(
       ({ node }) =>
         semanticRequireOriginCandidate(node, state) !== undefined ||
+        semanticModuleAcquisitionEffectOrigin(node, state) !== undefined ||
         hasSemanticCreateRequireFactoryOrigin(node, state),
     );
     if (
