@@ -258,6 +258,11 @@ export const documentationSections = [
         source: "guides/data/pcap-analysis.md",
         route: "/pcap-analysis",
       },
+      {
+        text: "Offline Cargo manifests",
+        source: "guides/data/cargo-manifests.md",
+        route: "/cargo-manifests",
+      },
     ],
   },
   {
