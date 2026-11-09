@@ -77,6 +77,12 @@ it.each([
   ["entry.js", "unspecified", "commonjs"],
   ["entry.ts", "unspecified", "unknown"],
   ["entry.js", "unknown", "unknown"],
+  // Node dispatches on the exact suffix, so a case-folded `.MJS`/`.CJS` does
+  // not select the lowercase suffix's loader mode; without another loader
+  // observation the context stays unknown. The `module`/`commonjs` rows above
+  // already pin the observed-type side of that contract.
+  ["entry.MJS", "commonjs", "unknown"],
+  ["entry.D.CTS", "commonjs", "unknown"],
 ] as const)(
   "preserves parser-owned %s context over an observed %s package type",
   (path, observed, expected) => {
