@@ -10,13 +10,15 @@ import type {
   JavaScriptSemanticResourceOperation,
 } from "./javascriptSemanticIr.js";
 import {
-  readExactJavaScriptLiteral,
+  isNullishJavaScriptSyntax,
   isObjectPrototypeSetter,
   primitiveOwnKeys,
+  readExactJavaScriptLiteral,
   semanticStaticPropertyName,
   staticJavaScriptTruthiness,
-  staticObjectPropertyReader,
   staticObjectCopyPropertyReader,
+  staticObjectProperty,
+  staticObjectPropertyReader,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { isUnmodifiedGlobalReference } from "./javascriptSemanticAmbientWrites.js";
@@ -78,7 +80,11 @@ export const collectJavaScriptSemanticResources = (
   const acquisitions = collectAcquisitions(program, context).filter(
     (candidate) =>
       !socketPortInFirstArgument(candidate) ||
-      (!rejectsSocketPortLiteral(candidate.node, context) &&
+      (!rejectsSocketPortLiteral(
+        candidate.node,
+        candidate.specifier,
+        context,
+      ) &&
         !rejectsTlsProtocolVersionLiteral(
           candidate.node,
           candidate.specifier,
@@ -576,24 +582,33 @@ const resourceCandidateId = (candidate: ResourceCandidate): string =>
  * `undefined` and an empty object throw `ERR_MISSING_ARGS`, but those are a
  * missing option rather than a bad port, so they stay undecided here.
  */
-const rejectsSocketPortLiteral = (
-  node: t.CallExpression | t.OptionalCallExpression,
+/** Whether a number is a TCP port Node accepts. */
+const isUsablePortNumber = (value: number): boolean =>
+  Number.isInteger(value) && value >= 0 && value <= 65535;
+
+/** Whether a string port reads as one Node accepts; Node coerces with `Number`. */
+const isUsablePortString = (text: string): boolean => {
+  if (text.trim().length === 0) return false;
+  return isUsablePortNumber(Number(text));
+};
+
+/**
+ * Whether an exactly readable `port` value is one Node rejects.
+ *
+ * This is the single reader for both the positional argument and the options member, so a
+ * rule learned here applies to both spellings. Measured on Node 24.22.1: `-1`, `70000`,
+ * `"x"`, `null` and `true` all throw while `8080`, `"8080"` and `0` connect. A sign
+ * over a numeric literal is judged by its value, because `-0` is port zero and connects
+ * while `+65536` is out of range.
+ */
+const rejectsPortValue = (
+  value: t.Node,
   context: DataEffectTraversalContext,
 ): boolean => {
-  const port = node.arguments[0];
-  if (port === undefined || t.isSpreadElement(port)) return false;
-  const value = unwrapJavaScriptExpression(port).node;
-  if (t.isStringLiteral(value)) return value.value.length === 0;
-  if (
-    t.isNullLiteral(value) ||
-    t.isBigIntLiteral(value) ||
-    t.isBooleanLiteral(value)
-  )
-    return true;
-  if (t.isNumericLiteral(value))
-    return (
-      !Number.isInteger(value.value) || value.value < 0 || value.value > 65535
-    );
+  if (t.isNullLiteral(value) || t.isBooleanLiteral(value)) return true;
+  if (t.isBigIntLiteral(value)) return true;
+  // `void <expr>` and `undefined` mean "not given", which Node fills with the default.
+  if (isNullishJavaScriptSyntax(value)) return false;
   // `NaN` and `Infinity` are unshadowed globals, and neither is a port.
   if (
     t.isIdentifier(value) &&
@@ -601,16 +616,132 @@ const rejectsSocketPortLiteral = (
     isUnmodifiedGlobalReference(value, context.state, value.name)
   )
     return true;
-  // `-1` and `-1.5` are unary expressions over numeric literals: always out of
-  // range because a port is never negative.
-  if (t.isUnaryExpression(value)) {
+  if (t.isNumericLiteral(value)) return !isUsablePortNumber(value.value);
+  if (t.isStringLiteral(value))
+    return value.value.length === 0 || !isUsablePortString(value.value);
+  if (t.isTemplateLiteral(value) && value.expressions.length === 0) {
+    const cooked = value.quasis[0]?.value.cooked;
+    return cooked === null || cooked === undefined
+      ? false
+      : cooked.length === 0 || !isUsablePortString(cooked);
+  }
+  if (
+    t.isUnaryExpression(value) &&
+    (value.operator === "+" || value.operator === "-")
+  ) {
     const operand = unwrapJavaScriptExpression(value.argument).node;
-    return (
-      t.isNumericLiteral(operand) &&
-      (value.operator === "-" || !Number.isInteger(operand.value))
+    if (
+      t.isIdentifier(operand) &&
+      (operand.name === "NaN" || operand.name === "Infinity")
+    )
+      return isUnmodifiedGlobalReference(operand, context.state, operand.name);
+    if (!t.isNumericLiteral(operand)) return false;
+    return !isUsablePortNumber(
+      value.operator === "-" ? -operand.value : operand.value,
     );
   }
   return false;
+};
+
+/**
+ * Whether an exactly readable `path` member neutralises the port.
+ *
+ * A non-empty `path` becomes the Unix socket, so Node never reads `port`. Measured on
+ * Node 24.22.1, `tls.connect({path: "/tmp/x.sock", port: -1})` connects while
+ * `tls.connect({port: -1})` throws. An empty string and a nullish value do not neutralise.
+ */
+const hasUsablePath = (
+  options: t.ObjectExpression,
+  context: DataEffectTraversalContext,
+): boolean => {
+  const lookup = staticObjectProperty(
+    options,
+    "path",
+    isNullishJavaScriptSyntax,
+  );
+  if (lookup.status !== "explicit") return false;
+  const value = unwrapJavaScriptExpression(lookup.value).node;
+  if (t.isStringLiteral(value)) return value.value.length !== 0;
+  if (t.isTemplateLiteral(value) && value.expressions.length === 0) {
+    const cooked = value.quasis[0]?.value.cooked;
+    return cooked !== null && cooked !== undefined && cooked !== "";
+  }
+  return false;
+};
+
+/** Whether an object literal carries a `port` member this reader can decide. */
+const optionsPortRejects = (
+  options: t.ObjectExpression,
+  context: DataEffectTraversalContext,
+): boolean => {
+  // A non-empty path becomes the Unix socket and Node never reads the port.
+  if (hasUsablePath(options, context)) return false;
+  const lookup = staticObjectProperty(
+    options,
+    "port",
+    isNullishJavaScriptSyntax,
+  );
+  if (lookup.status !== "explicit") return false;
+  return rejectsPortValue(
+    unwrapJavaScriptExpression(lookup.value).node,
+    context,
+  );
+};
+
+/**
+ * Whether a `net`/`tls` acquisition provably throws before a socket exists.
+ *
+ * The port can arrive positionally or inside an options object, and both spellings are
+ * judged by the same value rules. Measured on Node 24.22.1, `net.connect({port: -1})`,
+ * `net.connect({port: 70000})` and `net.connect({port: "x"})` all throw
+ * `ERR_SOCKET_BAD_PORT`, and so does `tls.connect({port: -1})`.
+ *
+ * `tls` also reads an options object in slot 1 when slot 0 is an empty path: measured on
+ * Node 24.22.1, `tls.connect("", {port: 80})` and `tls.connect("", {path: "/tmp/x"})`
+ * connect while `tls.connect("", {})` throws and `net.connect("", {port: 80})` throws. An
+ * empty path therefore only occupies the positional slot for `tls`.
+ */
+const rejectsSocketPortLiteral = (
+  node: t.CallExpression | t.OptionalCallExpression,
+  specifier: string,
+  context: DataEffectTraversalContext,
+): boolean => {
+  const port = node.arguments[0];
+  if (port === undefined || t.isSpreadElement(port)) return false;
+  const value = unwrapJavaScriptExpression(port).node;
+  if (t.isObjectExpression(value)) return optionsPortRejects(value, context);
+  // A string in the positional slot is a Unix path, not a port, so only an empty one can
+  // fail here: measured on Node 24.22.1, `tls.connect("/tmp/x.sock")` connects while
+  // `net.connect("")` throws.
+  if (t.isStringLiteral(value) || t.isTemplateLiteral(value)) {
+    const text = t.isStringLiteral(value)
+      ? value.value
+      : value.expressions.length === 0
+        ? value.quasis[0]?.value.cooked
+        : null;
+    if (text === null || text === undefined) return false;
+    if (text.length !== 0) return false;
+    if (specifier !== "tls") return true;
+    // `tls` reads an options object in slot 1 after an empty path. Measured on Node
+    // 24.22.1, `tls.connect("", {port: 80})` and `tls.connect("", {path: "/tmp/x"})`
+    // connect while `tls.connect("", {})` throws.
+    const second = node.arguments[1];
+    if (second === undefined || t.isSpreadElement(second)) return true;
+    const options = unwrapJavaScriptExpression(second).node;
+    if (!t.isObjectExpression(options)) return true;
+    if (hasUsablePath(options, context)) return false;
+    const lookup = staticObjectProperty(
+      options,
+      "port",
+      isNullishJavaScriptSyntax,
+    );
+    if (lookup.status !== "explicit") return true;
+    return rejectsPortValue(
+      unwrapJavaScriptExpression(lookup.value).node,
+      context,
+    );
+  }
+  return rejectsPortValue(value, context);
 };
 
 /**
