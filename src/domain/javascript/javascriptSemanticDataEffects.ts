@@ -12,6 +12,7 @@ import {
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
   semanticStaticPropertyName,
+  staticObjectProperty,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
@@ -271,6 +272,9 @@ const collectRequests = (
       !URL.canParse(endpoint)
     )
       return;
+    // `http`/`https` validate the path before the request exists, so an unescaped
+    // character throws from the call itself.
+    if (rejectsHttpPathLiteral(node, method)) return;
     output.push({
       node,
       operation: {
@@ -579,6 +583,57 @@ const requestFields = (
   });
 };
 
+/**
+ * The characters Node refuses in an `http.request` path.
+ *
+ * `checkInvalidHeaderChar` is not what runs here; the path goes through
+ * `validatePath`/`ERR_UNESCAPED_CHARACTERS`. Measured on Node 24.22.1, the accepted range is
+ * exactly `U+0021`-`U+00FF`: every ASCII code point was enumerated inside a literal path and
+ * `0x00`-`0x20` are refused, and probing the upper bound refuses `U+0100` onward while
+ * `U+007f`, `U+00a0`, `U+00e9` and `U+00ff` are accepted. So this is a closed range rather
+ * than a list of known-bad characters, and it is Latin-1 rather than ASCII. A space is
+ * refused: `path: "/a b"` throws while `"/a%20b"` connects. `U+0100` and above are refused,
+ * so `path: "/aĀb"` throws too.
+ */
+const UNESCAPED_PATH_CHARACTER = /[^\u0021-\u00ff]/u;
+
+/**
+ * Whether a literal `options.path` makes `http.request` throw before any request exists.
+ *
+ * `http` and `https` validate the path before the request is built, so a literal carrying a
+ * refused character throws `ERR_UNESCAPED_CHARACTERS` from the call itself. Measured on Node
+ * 24.22.1, an empty path is accepted because Node treats `""` as "not given" and falls back
+ * to `/`.
+ */
+const rejectsHttpPathLiteral = (
+  node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
+  method: JavaScriptSemanticRequestOperation["method"],
+): boolean => {
+  if (method !== "get" && method !== "request") return false;
+  const first = node.arguments[0];
+  if (first === undefined) return false;
+  const firstValue = unwrapJavaScriptExpression(first).node;
+  const optionsIndex = t.isObjectExpression(firstValue) ? 0 : 1;
+  // Only a spread at or before the options slot can move it. Measured on Node 24.22.1,
+  // `http.request({path: "/a b"}, ...callbacks)` still throws ERR_UNESCAPED_CHARACTERS,
+  // because expanding a later argument cannot change the object Node already picked.
+  for (let index = 0; index <= optionsIndex; index++)
+    if (
+      index < node.arguments.length &&
+      t.isSpreadElement(node.arguments[index]!)
+    )
+      return false;
+  const options =
+    optionsIndex === 0
+      ? firstValue
+      : unwrapJavaScriptExpression(node.arguments[1] ?? first).node;
+  if (!t.isObjectExpression(options)) return false;
+  const lookup = staticObjectProperty(options, "path");
+  if (lookup.status !== "explicit") return false;
+  const literal = readExactJavaScriptLiteral(lookup.value);
+  if (!literal.found || typeof literal.value !== "string") return false;
+  return UNESCAPED_PATH_CHARACTER.test(literal.value);
+};
 const requestEndpoint = (
   node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
 ): string | null =>
