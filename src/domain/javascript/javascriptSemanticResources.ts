@@ -644,38 +644,91 @@ const rejectsPortValue = (
 };
 
 /**
- * Whether an exactly readable `path` member neutralises the port.
+ * The path states a socket options object can be in.
  *
- * A non-empty `path` becomes the Unix socket, so Node never reads `port`. Measured on
- * Node 24.22.1, `tls.connect({path: "/tmp/x.sock", port: -1})` connects while
- * `tls.connect({port: -1})` throws. An empty string and a nullish value do not neutralise.
+ * `selected` means Node connects over a Unix socket and never reads `port`; `ignored`
+ * means the path is empty or nullish so the port decides; `invalid` means the value throws
+ * before either is used; `unknown` means this reader cannot tell. Collapsing these into a
+ * boolean loses two calls in opposite directions. Measured on Node 24.22.1:
+ *
+ * | `path` | outcome |
+ * | --- | --- |
+ * | `"/tmp/x.sock"`, with `port: -1` | socket created — the port is never read |
+ * | `""` or `null`, with `port: -1` | THREW `ERR_SOCKET_BAD_PORT` |
+ * | `true`, with `port: 80` | THREW `ERR_INVALID_ARG_TYPE` |
  */
-const hasUsablePath = (
+type SocketPathSelection = "selected" | "ignored" | "invalid" | "unknown";
+
+/** Classify an options object's `path` member without conflating its states. */
+const socketPathSelection = (
   options: t.ObjectExpression,
   context: DataEffectTraversalContext,
-): boolean => {
+): SocketPathSelection => {
   const lookup = staticObjectProperty(
     options,
     "path",
     isNullishJavaScriptSyntax,
   );
-  if (lookup.status !== "explicit") return false;
+  if (lookup.status === "missing") return "ignored";
+  if (lookup.status !== "explicit") return "unknown";
   const value = unwrapJavaScriptExpression(lookup.value).node;
-  if (t.isStringLiteral(value)) return value.value.length !== 0;
+  if (isNullishJavaScriptSyntax(value)) return "ignored";
+  if (t.isStringLiteral(value))
+    return value.value.length === 0 ? "ignored" : "selected";
   if (t.isTemplateLiteral(value) && value.expressions.length === 0) {
     const cooked = value.quasis[0]?.value.cooked;
-    return cooked !== null && cooked !== undefined && cooked !== "";
+    if (cooked === null || cooked === undefined) return "unknown";
+    return cooked.length === 0 ? "ignored" : "selected";
   }
-  return false;
+  // Any other known value is not a path, so Node refuses it before connecting.
+  if (
+    t.isBooleanLiteral(value) ||
+    t.isNumericLiteral(value) ||
+    t.isBigIntLiteral(value) ||
+    t.isObjectExpression(value) ||
+    t.isArrayExpression(value) ||
+    t.isRegExpLiteral(value) ||
+    t.isArrowFunctionExpression(value) ||
+    t.isFunctionExpression(value) ||
+    t.isClassExpression(value)
+  )
+    return "invalid";
+  return "unknown";
 };
 
-/** Whether an object literal carries a `port` member this reader can decide. */
+/**
+ * Whether an options object carries a getter Node runs while it copies the members.
+ *
+ * Only a getter runs during the copy. Measured on Node 24.22.1, a setter or a plain method
+ * leaves the port decision alone: `{set port(_) {}, port: -1}` and `{method() {}, port: -1}`
+ * both throw `ERR_SOCKET_BAD_PORT`, while `{get side() { this.port = 80; }, port: -1}`
+ * connects because the getter wrote the port first.
+ */
+const hasOptionGetter = (options: t.ObjectExpression): boolean =>
+  options.properties.some(
+    (property) => t.isObjectMethod(property) && property.kind === "get",
+  );
+
+/**
+ * Whether a single options object provably throws before a socket exists.
+ *
+ * A `selected` path becomes the Unix socket and Node never reads the port, so a bad port
+ * next to a real path is not a failure. Measured on Node 24.22.1,
+ * `net.connect({path: "/tmp/x.sock", port: -1})` connects while
+ * `net.connect({path: "", port: -1})` throws `ERR_SOCKET_BAD_PORT`.
+ *
+ * An accessor anywhere in the object can write `port` before Node copies it, so the
+ * apparent literal is not the runtime value. Measured on Node 24.22.1,
+ * `net.connect({get side() { this.port = 80; }, port: -1})` connects.
+ */
 const optionsPortRejects = (
   options: t.ObjectExpression,
   context: DataEffectTraversalContext,
 ): boolean => {
-  // A non-empty path becomes the Unix socket and Node never reads the port.
-  if (hasUsablePath(options, context)) return false;
+  if (hasOptionGetter(options)) return false;
+  const selection = socketPathSelection(options, context);
+  if (selection === "selected" || selection === "unknown") return false;
+  if (selection === "invalid") return true;
   const lookup = staticObjectProperty(
     options,
     "port",
@@ -688,6 +741,18 @@ const optionsPortRejects = (
   );
 };
 
+/** Whether a value is a primitive or callable, so it cannot carry option members. */
+const carriesNoOptionMembers = (value: t.Node): boolean =>
+  isNullishJavaScriptSyntax(value) ||
+  t.isBooleanLiteral(value) ||
+  t.isNumericLiteral(value) ||
+  t.isBigIntLiteral(value) ||
+  t.isStringLiteral(value) ||
+  t.isRegExpLiteral(value) ||
+  t.isArrowFunctionExpression(value) ||
+  t.isFunctionExpression(value) ||
+  t.isClassExpression(value);
+
 /**
  * Whether a `net`/`tls` acquisition provably throws before a socket exists.
  *
@@ -695,6 +760,12 @@ const optionsPortRejects = (
  * judged by the same value rules. Measured on Node 24.22.1, `net.connect({port: -1})`,
  * `net.connect({port: 70000})` and `net.connect({port: "x"})` all throw
  * `ERR_SOCKET_BAD_PORT`, and so does `tls.connect({port: -1})`.
+ *
+ * `tls` merges one later options object over the first, so the effective port can come
+ * from either: measured on Node 24.22.1, `tls.connect({port: -1}, {port: 443})` connects
+ * while `tls.connect({port: 443}, {port: -1})` throws. `tlsOptionMerge` already models
+ * that merge for the protocol-version reader, so the same selection is reused rather than
+ * re-derived; two readers of one merge could drift apart.
  *
  * `tls` also reads an options object in slot 1 when slot 0 is an empty path: measured on
  * Node 24.22.1, `tls.connect("", {port: 80})` and `tls.connect("", {path: "/tmp/x"})`
@@ -709,7 +780,36 @@ const rejectsSocketPortLiteral = (
   const port = node.arguments[0];
   if (port === undefined || t.isSpreadElement(port)) return false;
   const value = unwrapJavaScriptExpression(port).node;
-  if (t.isObjectExpression(value)) return optionsPortRejects(value, context);
+  if (t.isObjectExpression(value)) {
+    if (specifier !== "tls") return optionsPortRejects(value, context);
+    const merge = tlsOptionMerge(node, context.state);
+    if (merge === undefined || merge.target === "unknown") return false;
+    const target = merge.target === "fresh" ? undefined : merge.target;
+    const source = merge.source;
+    if (source !== undefined && t.isObjectExpression(source)) {
+      // A later object replaces a member it writes, so its own members decide first.
+      if (hasOptionGetter(source)) return false;
+      const sourcePath = socketPathSelection(source, context);
+      if (sourcePath === "selected") return false;
+      if (sourcePath === "invalid") return true;
+      if (sourcePath !== "ignored") return false;
+      const sourcePort = staticObjectProperty(
+        source,
+        "port",
+        isNullishJavaScriptSyntax,
+      );
+      if (sourcePort.status === "explicit")
+        return rejectsPortValue(
+          unwrapJavaScriptExpression(sourcePort.value).node,
+          context,
+        );
+      if (sourcePort.status !== "missing") return false;
+    } else if (source !== undefined && !carriesNoOptionMembers(source)) {
+      // A source this reader cannot read may carry any member, so the merge is open.
+      return false;
+    }
+    return target === undefined ? false : optionsPortRejects(target, context);
+  }
   // A string in the positional slot is a Unix path, not a port, so only an empty one can
   // fail here: measured on Node 24.22.1, `tls.connect("/tmp/x.sock")` connects while
   // `net.connect("")` throws.
@@ -722,14 +822,14 @@ const rejectsSocketPortLiteral = (
     if (text === null || text === undefined) return false;
     if (text.length !== 0) return false;
     if (specifier !== "tls") return true;
-    // `tls` reads an options object in slot 1 after an empty path. Measured on Node
-    // 24.22.1, `tls.connect("", {port: 80})` and `tls.connect("", {path: "/tmp/x"})`
-    // connect while `tls.connect("", {})` throws.
     const second = node.arguments[1];
     if (second === undefined || t.isSpreadElement(second)) return true;
     const options = unwrapJavaScriptExpression(second).node;
     if (!t.isObjectExpression(options)) return true;
-    if (hasUsablePath(options, context)) return false;
+    const selection = socketPathSelection(options, context);
+    if (selection === "selected") return false;
+    if (selection === "invalid") return true;
+    if (selection !== "ignored") return false;
     const lookup = staticObjectProperty(
       options,
       "port",

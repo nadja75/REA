@@ -67,3 +67,30 @@ it.each([
     expect(acquisitionsFor(call)).toEqual([]);
   },
 );
+
+it.each([
+  // `tls` merges slot 1 over slot 0, so the effective port can come from either.
+  [`tls.connect({ port: -1 }, { port: 443 })`],
+  [`tls.connect({ port: -1 }, { path: "/tmp/x" })`],
+  [`net.connect({ path: "/tmp/sock", port: -1 })`],
+  [`net.connect({ get side() { this.port = 80; }, port: -1 })`],
+] as const)(
+  "keeps the acquisition for a merged or accessor-written port: %s",
+  (call) => {
+    expect(acquisitionsFor(call)).toHaveLength(1);
+  },
+);
+
+it.each([
+  [`tls.connect({ port: 443 }, { port: -1 })`],
+  [`tls.connect({ port: -1 }, {})`],
+  [`net.connect({ path: "", port: -1 })`],
+  [`net.connect({ path: null, port: -1 })`],
+  [`tls.connect("", { path: true, port: 80 })`],
+  // A setter or a plain method never runs during Node's copy, so the literal still decides.
+  [`net.connect({ set port(_) {}, port: -1 })`],
+  [`net.connect({ set side(_) {}, port: -1 })`],
+  [`net.connect({ method() {}, port: -1 })`],
+] as const)("emits no acquisition for a decided bad port: %s", (call) => {
+  expect(acquisitionsFor(call)).toEqual([]);
+});
