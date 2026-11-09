@@ -45,3 +45,30 @@ it.each([
 ] as const)("keeps the request for an accepted method: %s", (call) => {
   expect(requestsFor(call)).toHaveLength(1);
 });
+
+it.each([
+  // An erased TypeScript assertion is the same object at runtime, so the method is still
+  // validated. Measured on Node 24.22.1, this throws ERR_INVALID_HTTP_TOKEN.
+  [
+    `http.request(({ host: "h", method: "BAD METHOD" } as any))`,
+    `http.request(({ host: "h", method: "BAD METHOD" }) as any)`,
+  ],
+] as const)(
+  "reads the options through an erased assertion: %s",
+  (_name, call) => {
+    expect(
+      analyzeJavaScriptSemantics(
+        `import http from "node:http";\nfunction f() { ${call}; }`,
+      ).requestOperations,
+    ).toEqual([]);
+  },
+);
+
+it("keeps the request when a leading spread shifts the options slot", () => {
+  // The spread supplies the options and the callback, so the trailing object is ignored
+  // and Node builds a GET request. Measured on Node 24.22.1.
+  const operations = analyzeJavaScriptSemantics(
+    `import http from "node:http";\nfunction f() { const a = [{ host: "h" }, () => {}]; http.request(...a, { method: "BAD METHOD" }); }`,
+  ).requestOperations;
+  expect(operations).toHaveLength(1);
+});

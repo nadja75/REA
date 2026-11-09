@@ -610,12 +610,24 @@ const rejectsHttpMethodLiteral = (
 ): boolean => {
   // `fetch` and `WebSocket` read a different member and do not validate a token.
   if (method !== "get" && method !== "request") return false;
-  const options = t.isObjectExpression(node.arguments[0])
-    ? node.arguments[0]
-    : node.arguments[1];
-  if (options === undefined) return false;
-  const expression = unwrapJavaScriptExpression(options).node;
-  if (!t.isObjectExpression(expression)) return false;
+  // A spread before the options slot can supply several runtime arguments, so a later
+  // syntactic object is not necessarily the options Node reads. Measured on Node
+  // 24.22.1, `http.request(...[{host, path}, () => {}], {method: "BAD METHOD"})` returns
+  // a GET request, so the trailing object is ignored and the call must be kept.
+  if (node.arguments.some((argument) => t.isSpreadElement(argument)))
+    return false;
+  // The value is unwrapped before the slot is chosen, because an erased TypeScript
+  // assertion is the same object at runtime: measured on Node 24.22.1,
+  // `http.request({method: "BAD METHOD"} as any)` throws ERR_INVALID_HTTP_TOKEN.
+  const first = node.arguments[0];
+  const firstValue =
+    first === undefined ? undefined : unwrapJavaScriptExpression(first).node;
+  const options =
+    firstValue !== undefined && t.isObjectExpression(firstValue)
+      ? firstValue
+      : unwrapJavaScriptExpression(node.arguments[1] ?? first!).node;
+  if (!t.isObjectExpression(options)) return false;
+  const expression = options;
   const lookup = staticObjectProperty(expression, "method");
   if (lookup.status !== "explicit") return false;
   const literal = readExactJavaScriptLiteral(lookup.value);
