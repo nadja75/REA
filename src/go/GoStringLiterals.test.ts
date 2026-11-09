@@ -515,6 +515,7 @@ it("indexes 25,000 Mach-O load regions and sections without quadratic stalls and
       declared_range: { offset: BigInt(offset), size: BigInt(slotBytes) },
       segment_mapping: mapping,
       segment_unmapped: false,
+      on_disk: true,
       relocations: { offset: 0, count: 0 },
       offset,
       size: slotBytes,
@@ -538,6 +539,7 @@ it("indexes 25,000 Mach-O load regions and sections without quadratic stalls and
 
   const container: BinaryContainer = {
     format: "macho",
+    macho_cpu_type: 0x0100000c,
     architecture: "arm64",
     bits: 64,
     byte_order: "little",
@@ -681,6 +683,7 @@ it.each([
     };
     const container: BinaryContainer = {
       format: "macho",
+      macho_cpu_type: 0x0100000c,
       architecture: "arm64",
       bits: 64,
       byte_order: "little",
@@ -711,6 +714,7 @@ it.each([
           declared_range: { offset: 0n, size: 16n },
           segment_mapping: roMapping,
           segment_unmapped: false,
+          on_disk: true,
           relocations: { offset: 0, count: 0 },
           offset: 0,
           size: 16,
@@ -728,6 +732,7 @@ it.each([
           declared_range: { offset: 16n, size: 16n },
           segment_mapping: dataMapping,
           segment_unmapped: false,
+          on_disk: true,
           relocations: { offset: 0, count: 0 },
           offset: 16,
           size: 16,
