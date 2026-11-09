@@ -42,8 +42,8 @@ import { roleFacts, stateDirectoryOf } from "./stateRoles.js";
 import { shellQuote } from "./shellQuote.js";
 export { shellQuote } from "./shellQuote.js";
 
-/** agentenv-framework release the exported class was checked against. */
-export const DESKTOP_EXPORT_FRAMEWORK_VERSION = "0.9.1464";
+/** agentenv-framework release targeted by the exported class. */
+export const DESKTOP_EXPORT_FRAMEWORK_VERSION = "0.9.1485";
 
 /** Everything the export renders, decided from a capture and its state view. */
 export interface DesktopAppExportPlan {
@@ -94,6 +94,7 @@ export interface DesktopAppExportPlan {
   readonly stateAliases?: readonly {
     readonly alias: string;
     readonly target: string;
+    readonly kind?: "file" | "directory";
   }[];
   /** Files under the owned paths that existed before the capture but whose bytes were not retained. */
   readonly unseededFiles: readonly string[];
@@ -306,14 +307,14 @@ const capturedStateAliases = (capture: DesktopApplicationCapture) => {
   const relative = (path: string) =>
     path.startsWith(`${home}/`) ? path.slice(home.length + 1) : null;
   const aliases = (capture.state.selected_paths ?? []).flatMap(
-    ({ path, physical }) => {
+    ({ path, physical, kind }) => {
       const index = walked.indexOf(physical);
       const state = index < 0 ? undefined : roots[index]?.path;
       const alias = relative(path);
       const target = state === undefined ? null : relative(state);
       return alias === null || target === null || alias === target
         ? []
-        : [{ alias, target }];
+        : [{ alias, target, ...(kind === undefined ? {} : { kind }) }];
     },
   );
   const retained: typeof aliases = [];
@@ -616,7 +617,7 @@ TEXT_SEEDS = frozenset(${pyList(plan.textSeeds)})
 SEED_MODES = {${Object.entries(plan.seedModes)
     .map(([home, mode]) => `${py(home)}: 0o${mode.toString(8)}`)
     .join(", ")}}
-STATE_ALIASES = [${(plan.stateAliases ?? []).map(({ alias, target }) => `(${py(alias)}, ${py(target)})`).join(", ")}]
+STATE_ALIASES = [${(plan.stateAliases ?? []).map(({ alias, target, kind }) => `(${py(alias)}, ${py(target)}, ${kind === undefined ? "None" : py(kind)})`).join(", ")}]
 WINDOW_CLASS = ${py(plan.windowClass)}
 WITHHELD = {${(plan.withheld ?? []).map(({ setting, file }) => `${py(setting)}: ${py(file)}`).join(", ")}}
 ${PYTHON_HELPERS}
@@ -729,7 +730,7 @@ export const renderReadme = (
   `# ${plan.title} computer app
 
 Exported by REA's \`export-desktop-application\` from a capture of the \`${plan.aptPackage}\` ${plan.download === undefined ? "package" : downloadKind(plan.download)}
-(capture Evidence \`${plan.captureEvidenceId}\`). It was checked against agentenv-framework
+(capture Evidence \`${plan.captureEvidenceId}\`). It targets agentenv-framework
 ${DESKTOP_EXPORT_FRAMEWORK_VERSION}.
 
 - \`envs/${plan.name}/\` is a computer app on the \`ubuntu-24.04\` base with the \`reference\` driver, for
