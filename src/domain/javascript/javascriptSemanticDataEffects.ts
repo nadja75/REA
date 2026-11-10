@@ -11,6 +11,7 @@ import {
   javaScriptExpressionWrapperTarget,
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
+  staticObjectProperty,
   semanticStaticPropertyName,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
@@ -271,6 +272,9 @@ const collectRequests = (
       !URL.canParse(endpoint)
     )
       return;
+    // `http`/`https` validate `options.method` with `checkIsHttpToken` before the request
+    // exists, so a literal outside the token set throws from the call itself.
+    if (rejectsHttpMethodLiteral(node, method)) return;
     output.push({
       node,
       operation: {
@@ -579,6 +583,57 @@ const requestFields = (
   });
 };
 
+/**
+ * The characters RFC 9110 allows in a method token, which is what Node's
+ * `checkIsHttpToken` accepts.
+ *
+ * Measured on Node 24.22.1, `method: "M-SEARCH"`, `"X"` and the punctuation set
+ * `"!#$%&'*+-.^_` | "~"` all construct a request, while `"G/ET"`, `"G:ET"`, `"G(ET"`,
+ * `"G,ET"`, `"G"ET"`, `"GéT"`, `" "` and `"\\t"` throw `ERR_INVALID_HTTP_TOKEN`. The set is
+ * a closed character class rather than a list of verbs, so `"GET "` fails on the trailing
+ * space and `"get"` is accepted.
+ */
+const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]*$/u;
+
+/**
+ * Whether a literal `options.method` makes `http.request` throw before any request exists.
+ *
+ * `http` and `https` validate the method with `checkIsHttpToken` before they build the
+ * request, so a literal outside `HTTP_TOKEN` throws `ERR_INVALID_HTTP_TOKEN` from the call
+ * itself. Measured on Node 24.22.1, an empty string is accepted: Node treats `""` as "not
+ * given" and falls back to `GET`. A non-string value throws `ERR_INVALID_ARG_TYPE` too, but
+ * it is left undecided here because the reported fields do not describe the type check.
+ */
+const rejectsHttpMethodLiteral = (
+  node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
+  method: JavaScriptSemanticRequestOperation["method"],
+): boolean => {
+  // `fetch` and `WebSocket` read a different member and do not validate a token.
+  if (method !== "get" && method !== "request") return false;
+  // A spread before the options slot can supply several runtime arguments, so a later
+  // syntactic object is not necessarily the options Node reads. Measured on Node
+  // 24.22.1, `http.request(...[{host, path}, () => {}], {method: "BAD METHOD"})` returns
+  // a GET request, so the trailing object is ignored and the call must be kept.
+  if (node.arguments.some((argument) => t.isSpreadElement(argument)))
+    return false;
+  // The value is unwrapped before the slot is chosen, because an erased TypeScript
+  // assertion is the same object at runtime: measured on Node 24.22.1,
+  // `http.request({method: "BAD METHOD"} as any)` throws ERR_INVALID_HTTP_TOKEN.
+  const first = node.arguments[0];
+  const firstValue =
+    first === undefined ? undefined : unwrapJavaScriptExpression(first).node;
+  const options =
+    firstValue !== undefined && t.isObjectExpression(firstValue)
+      ? firstValue
+      : unwrapJavaScriptExpression(node.arguments[1] ?? first!).node;
+  if (!t.isObjectExpression(options)) return false;
+  const expression = options;
+  const lookup = staticObjectProperty(expression, "method");
+  if (lookup.status !== "explicit") return false;
+  const literal = readExactJavaScriptLiteral(lookup.value);
+  if (!literal.found || typeof literal.value !== "string") return false;
+  return literal.value !== "" && !HTTP_TOKEN.test(literal.value);
+};
 const requestEndpoint = (
   node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
 ): string | null =>
